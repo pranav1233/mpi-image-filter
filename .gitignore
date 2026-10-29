@@ -1,0 +1,5 @@
+build/
+bin/
+results/*
+!results/final/
+__pycache__/
