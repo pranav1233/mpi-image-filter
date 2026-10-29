@@ -12,6 +12,7 @@
 #include "cli.h"
 #include "decomp.h"
 #include "filters.h"
+#include "timing.h"
 
 enum { RUN = 0, EXIT_OK = 1, EXIT_FAIL = 2 };
 
@@ -26,7 +27,7 @@ typedef struct {
 /* Rank 0 only: parse args, read the image and check that the run is
  * possible. Any problem is reported here and turned into a status, so all
  * ranks can exit together after the broadcast. */
-static int setup_root(int argc, char **argv, int nprocs, Options *opt, Image *img)
+static int setup_root(int argc, char **argv, int nprocs, Options *opt, Image *img, double *t_read)
 {
     char err[512];
     int rc = cli_parse(argc, argv, opt, err, sizeof err);
@@ -35,7 +36,10 @@ static int setup_root(int argc, char **argv, int nprocs, Options *opt, Image *im
         return rc > 0 ? EXIT_OK : EXIT_FAIL;
     }
     int halo = filter_halo_rows(opt->filter, opt->radius, opt->sigma);
-    if (bmp_read(opt->input, img, err, sizeof err) != 0) {
+    double t0 = timing_now();
+    rc = bmp_read(opt->input, img, err, sizeof err);
+    *t_read = timing_now() - t0;
+    if (rc != 0) {
         fprintf(stderr, "error: %s\n", err);
         return EXIT_FAIL;
     }
@@ -79,9 +83,17 @@ static void *xmalloc(size_t n, int rank)
     return p;
 }
 
+/* Start a timed phase on every rank at the same moment, so one phase's
+ * stragglers are not billed to the next phase. */
+static double phase_start(void)
+{
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    return timing_now();
+}
+
 /* Scatter, filter `iterations` times, gather. On rank 0 img->data receives
- * the result. */
-static void run_filter(const Params *p, Image *img)
+ * the result. Fills this rank's scatter/compute/halo/gather times. */
+static void run_filter(const Params *p, Image *img, Timings *t)
 {
     Decomp d;
     decomp_init(&d, MPI_COMM_WORLD, p->width, p->height);
@@ -98,22 +110,42 @@ static void run_filter(const Params *p, Image *img)
     size_t off = (size_t)plan.halo * rb;
     uint8_t *buf[2] = {xmalloc(band_bytes, d.rank), xmalloc(band_bytes, d.rank)};
 
+    double t0 = phase_start();
     decomp_scatter(&d, d.rank == 0 ? img->data : NULL, buf[0] + off);
+    t->t_scatter = timing_now() - t0;
 
-    /* Data stays distributed across iterations: no gather/rescatter. */
+    /* Data stays distributed across iterations: no gather/rescatter. Halo
+     * time includes waiting for a slower neighbor, i.e. load imbalance. */
+    phase_start();
     int cur = 0;
     for (int it = 0; it < p->iterations; it++) {
+        double a = timing_now();
         decomp_exchange_halo(&d, buf[cur] + off, plan.halo);
+        double b = timing_now();
         filter_apply(&plan, buf[cur] + off, buf[1 - cur] + off, d.rows);
+        t->t_halo += b - a;
+        t->t_compute += timing_now() - b;
         cur = 1 - cur;
     }
 
+    t0 = phase_start();
     decomp_gather(&d, buf[cur] + off, d.rank == 0 ? img->data : NULL);
+    t->t_gather = timing_now() - t0;
 
     free(buf[0]);
     free(buf[1]);
     filter_plan_free(&plan);
     decomp_free(&d);
+}
+
+/* Reduce every phase time with MPI_MAX onto rank 0. */
+static void reduce_timings(const Timings *mine, Timings *max)
+{
+    double in[TIMINGS_COUNT] = {mine->t_read, mine->t_scatter, mine->t_compute, mine->t_halo,
+                                mine->t_gather, mine->t_write, mine->t_total};
+    double out[TIMINGS_COUNT] = {0};
+    MPI_CHECK(MPI_Reduce(in, out, TIMINGS_COUNT, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+    *max = (Timings){out[0], out[1], out[2], out[3], out[4], out[5], out[6]};
 }
 
 int main(int argc, char **argv)
@@ -127,8 +159,10 @@ int main(int argc, char **argv)
     Options opt;
     Image img = {0};
     Params p = {0};
+    Timings t = {0};
+    double t_start = phase_start();
     if (rank == 0) {
-        p.status = setup_root(argc, argv, nprocs, &opt, &img);
+        p.status = setup_root(argc, argv, nprocs, &opt, &img, &t.t_read);
         if (p.status == RUN) {
             p.width = img.width;
             p.height = img.height;
@@ -142,11 +176,27 @@ int main(int argc, char **argv)
 
     int exit_code = p.status == EXIT_FAIL ? EXIT_FAILURE : EXIT_SUCCESS;
     if (p.status == RUN) {
-        run_filter(&p, &img);
+        run_filter(&p, &img, &t);
         if (rank == 0) {
             char err[512];
+            double t0 = timing_now();
             if (bmp_write(opt.output, &img, err, sizeof err) != 0) {
                 fprintf(stderr, "error: %s\n", err);
+                exit_code = EXIT_FAILURE;
+            }
+            t.t_write = timing_now() - t0;
+        }
+        t.t_total = timing_now() - t_start;
+
+        Timings tmax;
+        reduce_timings(&t, &tmax);
+        if (rank == 0 && opt.timing_csv) {
+            /* radius column = effective filter radius, i.e. halo rows
+             * (ceil(3 sigma) for gaussian, 1 for sobel, 0 for grayscale). */
+            int radius = filter_halo_rows(opt.filter, opt.radius, opt.sigma);
+            if (timing_append_csv(opt.timing_csv, nprocs, p.width, p.height, cli_filter_name(opt.filter),
+                                  radius, p.iterations, &tmax) != 0) {
+                fprintf(stderr, "error: cannot write timing CSV %s\n", opt.timing_csv);
                 exit_code = EXIT_FAILURE;
             }
         }

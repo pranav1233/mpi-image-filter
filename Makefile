@@ -26,8 +26,8 @@ LDLIBS  = -lm
 OBJDIR  = build/$(BUILD)
 
 COMMON  = bmp.o filters.o cli.o
-SERIAL_OBJS = $(addprefix $(OBJDIR)/,$(COMMON) main_serial.o)
-MPI_OBJS    = $(addprefix $(OBJDIR)/,$(COMMON) decomp.o main_mpi.o)
+SERIAL_OBJS = $(addprefix $(OBJDIR)/,$(COMMON) timing.o main_serial.o)
+MPI_OBJS    = $(addprefix $(OBJDIR)/,$(COMMON) timing_mpi.o decomp.o main_mpi.o)
 
 .PHONY: all serial mpi debug test test-debug clean
 
@@ -43,6 +43,10 @@ $(BINDIR)/filter_mpi: $(MPI_OBJS) | $(BINDIR)
 # Files that include <mpi.h> must be compiled by the MPI wrapper.
 $(OBJDIR)/decomp.o $(OBJDIR)/main_mpi.o: $(OBJDIR)/%.o: src/%.c $(wildcard include/*.h) | $(OBJDIR)
 	$(MPICC) $(CFLAGS) -c -o $@ $<
+
+# timing.c is built twice: MPI_Wtime for the MPI driver, clock_gettime for serial.
+$(OBJDIR)/timing_mpi.o: src/timing.c include/timing.h | $(OBJDIR)
+	$(MPICC) $(CFLAGS) -DUSE_MPI -c -o $@ $<
 
 debug:
 	$(MAKE) BUILD=debug all
